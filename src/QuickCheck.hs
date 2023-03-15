@@ -49,9 +49,10 @@ module QuickCheck
 -- DRAFT implementation; last update 000104.
 -- Koen Claessen, John Hughes.
 
-import Random
-import List( group, sort, intersperse )
-import Monad( liftM2, liftM3, liftM4 )
+import System.Random
+import Data.Char
+import Data.List( group, sort, intersperse )
+import Control.Monad( liftM2, liftM3, liftM4 )
 
 infixr 0 ==>
 infix  1 `classify`
@@ -86,6 +87,14 @@ generate n rnd (Gen m) = m size rnd'
 
 instance Functor Gen where
   fmap f m = m >>= return . f
+
+instance Applicative Gen where
+    pure x = Gen $ \n r -> x
+    Gen f' <*> Gen x' = Gen $ \n r0 ->
+        let (r1,r2) = split r0
+            f = f' n r1
+            x = x' n r2
+        in f x
 
 instance Monad Gen where
   return a    = Gen (\n r -> a)
@@ -152,7 +161,7 @@ instance Arbitrary Int where
   coarbitrary n = variant (if n >= 0 then 2*n else 2*(-n) + 1)
 
 instance Arbitrary Integer where
-  arbitrary     = sized $ \n -> choose (-fromInt n,fromInt n)
+  arbitrary     = sized $ \n -> choose (-toInteger n, toInteger n)
   coarbitrary n = variant (fromInteger (if n >= 0 then 2*n else 2*(-n) + 1))
 
 instance Arbitrary Float where
