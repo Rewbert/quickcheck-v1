@@ -267,44 +267,55 @@ collect v = label (show v)
 data Config = Config
   { maxTest :: Int
   , maxFail :: Int
-  , size    :: Int -> Int
+  , size    :: Int -> Int -> Int
   , every   :: Int -> [String] -> String
   }
 
-quick :: Config
-quick = Config
-  { maxTest = 100
-  , maxFail = 1000
-  , size    = (+ 3) . (`div` 2)
+quick :: Int -> Int -> Int -> Config
+quick numTests discardRatio maxSize = Config
+  { maxTest = numTests
+  , maxFail = numTests * discardRatio
+  , size    = \n d -> computeSize n d maxSize numTests
   , every   = \n args -> let s = show n in s ++ [ '\b' | _ <- s ]
   }
-         
+
+computeSize :: Int -> Int -> Int -> Int -> Int
+computeSize n d maxSize maxSuccess
+  |    n `roundTo` maxSize + maxSize <= maxSuccess
+    || n >= maxSuccess
+    || maxSuccess `mod` maxSize == 0
+    = (n `mod` maxSize + d `div` 10) `min` maxSize
+  | otherwise
+    = ((n `mod` maxSize) * maxSize `div` (maxSuccess `mod` maxSize) + d `div` 10) `min` maxSize
+  where
+    roundTo :: Integral a => a -> a -> a
+    roundTo n m = (n `div` m) * m
+
 verbose :: Config
-verbose = quick
-  { every = \n args -> show n ++ ":\n" ++ unlines args
-  }
+verbose = let q = quick 100 10 100
+          in q { every = \n args -> show n ++ ":\n" ++ unlines args }
 
 test, quickCheck, verboseCheck :: Testable a => a -> IO ()
-test         = check quick
-quickCheck   = check quick
+test         = check $ quick 10000 10 100
+quickCheck   = check $ quick 10000 10 100
 verboseCheck = check verbose
          
 check :: Testable a => Config -> a -> IO ()
 check config a =
   do rnd <- newStdGen
-     tests config (evaluate a) rnd 0 0 []
+     tests config (evaluate a) rnd 0 0 0 []
 
-tests :: Config -> Gen Result -> StdGen -> Int -> Int -> [[String]] -> IO () 
-tests config gen rnd0 ntest nfail stamps
+tests :: Config -> Gen Result -> StdGen -> Int -> Int -> Int -> [[String]] -> IO () 
+tests config gen rnd0 ntest nfail nrecentlyfail stamps
   | ntest == maxTest config = do done "OK, passed" ntest stamps
   | nfail == maxFail config = do done "Arguments exhausted after" ntest stamps
   | otherwise               =
       do putStr (every config ntest (arguments result))
          case ok result of
            Nothing    ->
-             tests config gen rnd1 ntest (nfail+1) stamps
+             tests config gen rnd1 ntest (nfail+1) (nrecentlyfail+1) stamps
            Just True  ->
-             tests config gen rnd1 (ntest+1) nfail (stamp result:stamps)
+             tests config gen rnd1 (ntest+1) nfail 0 (stamp result:stamps)
            Just False ->
              putStr ( "Falsifiable, after "
                    ++ show ntest
@@ -312,7 +323,7 @@ tests config gen rnd0 ntest nfail stamps
                    ++ unlines (arguments result)
                     )
      where
-      result      = generate (size config ntest) rnd2 gen
+      result      = generate (size config ntest nrecentlyfail) rnd2 gen
       (rnd1,rnd2) = split rnd0
 
 done :: String -> Int -> [[String]] -> IO ()
