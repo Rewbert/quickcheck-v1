@@ -4,7 +4,7 @@ module QuickCheck
   , verboseCheck  -- :: prop -> IO ()
   , test          -- :: prop -> IO ()  -- = quickCheck
   
-  , Config(..)    -- :: *
+  , State(..)    -- :: *
   , check         -- :: Config -> prop -> IO ()
  
   -- property combinators
@@ -207,14 +207,13 @@ data Result
 nothing :: Result
 nothing = Result{ ok = Nothing, stamp = [], arguments = [] }
 
-newtype Property
-  = Prop (Gen Result)
+newtype Property = Prop { unGen :: Gen Result }
 
 result :: Result -> Property
 result res = Prop (return res)
 
 evaluate :: Testable a => a -> Gen Result
-evaluate a = gen where Prop gen = property a
+evaluate = unGen . property--gen where Prop gen = property a
 
 class Testable a where
   property :: a -> Property
@@ -264,67 +263,120 @@ collect v = label (show v)
 --------------------------------------------------------------------
 -- Testing
 
-data Config = Config
-  { maxTest :: Int
-  , maxFail :: Int
-  , size    :: Int -> Int -> Int
-  , every   :: Int -> [String] -> String
+data State = State
+  { maxTest              :: Int
+  , maxFail              :: Int
+  , numSuccess           :: Int
+  , numDiscarded         :: Int
+  , numRecentlyDiscarded :: Int
+  , seed                 :: StdGen
+  , labels               :: [[String]]
+  , size                 :: Int -> Int -> Int
+  , every                :: Int -> [String] -> String
+  , terminal             :: String -> IO ()
   }
 
-quick :: Int -> Int -> Int -> Config
-quick numTests discardRatio maxSize = Config
-  { maxTest = numTests
-  , maxFail = numTests * discardRatio
-  , size    = \n d -> computeSize n d maxSize numTests
-  , every   = \n args -> let s = show n in s ++ [ '\b' | _ <- s ]
+data Args = Args
+  { maxSuccess      :: Int
+  , maxDiscardRatio :: Int
+  , maxSize         :: Int
+  , chatty          :: Bool
   }
 
-computeSize :: Int -> Int -> Int -> Int -> Int
-computeSize n d maxSize maxSuccess
-  |    n `roundTo` maxSize + maxSize <= maxSuccess
-    || n >= maxSuccess
-    || maxSuccess `mod` maxSize == 0
-    = (n `mod` maxSize + d `div` 10) `min` maxSize
+stdArgs :: Args
+stdArgs = Args
+  { maxSuccess      = 100
+  , maxDiscardRatio = 10
+  , maxSize         = 100
+  , chatty          = True
+  }
+
+quick :: Args -> IO State
+quick a = do
+  g <- newStdGen
+  return $ State { maxTest              = maxSuccess a
+                 , maxFail              = maxSuccess a * maxDiscardRatio a
+                 , numSuccess           = 0
+                 , numDiscarded         = 0
+                 , numRecentlyDiscarded = 0
+                 , seed    = g
+                 , labels  = []
+                 , size    = computeSize a
+                 , every   = \n args -> let s = show n in s ++ [ '\b' | _ <- s ]
+                 , terminal = if chatty a then putStr else noOp
+                 }
+  where
+    noOp _ = return ()
+
+computeSize :: Args -> Int -> Int -> Int
+computeSize a n d
+  |    n `roundTo` (maxSize a) + (maxSize a) <= (maxSuccess a)
+    || n >= (maxSuccess a)
+    || (maxSuccess a) `mod` (maxSize a) == 0
+    = (n `mod` (maxSize a) + d `div` 10) `min` (maxSize a)
   | otherwise
-    = ((n `mod` maxSize) * maxSize `div` (maxSuccess `mod` maxSize) + d `div` 10) `min` maxSize
+    = ((n `mod` (maxSize a)) * (maxSize a) `div` ((maxSuccess a) `mod` (maxSize a)) + d `div` 10) `min` (maxSize a)
   where
     roundTo :: Integral a => a -> a -> a
     roundTo n m = (n `div` m) * m
 
-verbose :: Config
-verbose = let q = quick 100 10 100
-          in q { every = \n args -> show n ++ ":\n" ++ unlines args }
+verbose :: IO State
+verbose = do
+  q <- quick stdArgs
+  return $ q { every = \n args -> show n ++ ":\n" ++ unlines args }
 
-test, quickCheck, verboseCheck :: Testable a => a -> IO ()
-test         = check $ quick 10000 10 100
-quickCheck   = check $ quick 10000 10 100
-verboseCheck = check verbose
-         
-check :: Testable a => Config -> a -> IO ()
-check config a =
-  do rnd <- newStdGen
-     tests config (evaluate a) rnd 0 0 0 []
+test :: Testable a => a -> IO ()
+test gen = do
+  q <- quick stdArgs
+  check q gen
 
-tests :: Config -> Gen Result -> StdGen -> Int -> Int -> Int -> [[String]] -> IO () 
-tests config gen rnd0 ntest nfail nrecentlyfail stamps
-  | ntest == maxTest config = do done "OK, passed" ntest stamps
-  | nfail == maxFail config = do done "Arguments exhausted after" ntest stamps
+quickCheck :: Testable a => a -> IO ()
+quickCheck = quickCheckWith stdArgs
+
+quickCheckWith :: Testable a => Args -> a -> IO ()
+quickCheckWith a gen = do
+  q <- quick a
+  check q gen
+
+verboseCheck :: Testable a => a -> IO ()
+verboseCheck gen = do
+  q <- quick stdArgs
+  check q gen
+
+check :: Testable a => State -> a -> IO ()
+check st a = tests st (property a)
+
+tests :: State -> Property -> IO () 
+tests st f
+  | numSuccess st   == maxTest st =
+      done "OK, passed" (numSuccess st) (labels st)
+  | numDiscarded st == maxFail st =
+      done "Arguments exhausted after" (numSuccess st) (labels st)
   | otherwise               =
-      do putStr (every config ntest (arguments result))
+      do terminal st (every st (numSuccess st) (arguments result))
          case ok result of
-           Nothing    ->
-             tests config gen rnd1 ntest (nfail+1) (nrecentlyfail+1) stamps
-           Just True  ->
-             tests config gen rnd1 (ntest+1) nfail 0 (stamp result:stamps)
+           Nothing    -> tests (updateAfterFail st)    f
+           Just True  -> tests (updateAfterSuccess st result) f
            Just False ->
              putStr ( "Falsifiable, after "
-                   ++ show ntest
+                   ++ show (numSuccess st)
                    ++ " tests:\n"
                    ++ unlines (arguments result)
                     )
      where
-      result      = generate (size config ntest nrecentlyfail) rnd2 gen
-      (rnd1,rnd2) = split rnd0
+      result      = generate (size st (numSuccess st) (numRecentlyDiscarded st)) rnd2 (unGen f)
+      (rnd1,rnd2) = split (seed st)
+      updateAfterFail :: State -> State
+      updateAfterFail st = st { numDiscarded         = numDiscarded st + 1
+                              , numRecentlyDiscarded = numRecentlyDiscarded st + 1
+                              , seed                 = rnd1
+                              }
+      updateAfterSuccess :: State -> Result -> State
+      updateAfterSuccess st res = st { numSuccess           = numSuccess st + 1
+                                     , numRecentlyDiscarded = 0
+                                     , seed                 = rnd1
+                                     , labels               = stamp res : labels st
+                                     }
 
 done :: String -> Int -> [[String]] -> IO ()
 done mesg ntest stamps =
