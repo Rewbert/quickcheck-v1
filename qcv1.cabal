@@ -26,3 +26,14 @@ library QuickCheck
     exposed-modules: QuickCheck
     hs-source-dirs: src
     default-language: Haskell2010
+
+executable qc
+    build-depends: base, random, QuickCheck
+    main-is: Main.hs
+    hs-source-dirs: app
+    default-language: Haskell2010
+    ghc-options:
+      -threaded
+      -rtsopts
+      -feager-blackholing
+      -with-rtsopts=-N4

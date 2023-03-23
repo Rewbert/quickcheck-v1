@@ -1,6 +1,8 @@
 module QuickCheck
   -- testing functions
   ( quickCheck    -- :: prop -> IO ()
+  , quickCheckSeq
+  , quickCheckPar
   , verboseCheck  -- :: prop -> IO ()
   , test          -- :: prop -> IO ()  -- = quickCheck
   
@@ -51,8 +53,12 @@ module QuickCheck
 
 import System.Random
 import Data.Char
-import Data.List( group, sort, intersperse )
+import Data.List( group, sort, intersperse, zip5 )
 import Control.Monad( liftM2, liftM3, liftM4 )
+
+import Control.Concurrent
+import Data.IORef
+import Data.Maybe
 
 infixr 0 ==>
 infix  1 `classify`
@@ -274,6 +280,17 @@ data State = State
   , size                 :: Int -> Int -> Int
   , every                :: Int -> [String] -> String
   , terminal             :: String -> IO ()
+
+  -- parallelism
+  , numConcurrent      :: Int
+  , myId               :: Int
+  , signalGaveUp       :: IO ()
+  , signalTerminating  :: IO ()
+  , signalFailureFound :: Result -> IO ()
+  , testBudget         :: IORef Int
+  , stealTests         :: IO (Maybe Int)
+  , discardBudget      :: IORef Int
+  , stealDiscards      :: IO (Maybe Int)
   }
 
 data Args = Args
@@ -281,15 +298,165 @@ data Args = Args
   , maxDiscardRatio :: Int
   , maxSize         :: Int
   , chatty          :: Bool
+  , numTesters      :: Int
   }
 
 stdArgs :: Args
 stdArgs = Args
-  { maxSuccess      = 100
+  { maxSuccess      = 10000000
   , maxDiscardRatio = 10
   , maxSize         = 100
   , chatty          = True
+  , numTesters      = 1
   }
+
+quickCheckSeq :: Testable a => a -> IO ()
+quickCheckSeq p = quickCheckInternal stdArgs p
+
+quickCheckPar :: Testable a => a -> IO ()
+quickCheckPar p = do
+  nh <- getNumCapabilities
+  quickCheckInternal (stdArgs { numTesters = nh}) p
+
+quickCheckInternal :: Testable a => Args -> a -> IO ()
+quickCheckInternal a p = do
+  rnd <- newStdGen
+  let initialSeeds = snd $ foldr (\_ (rnd, a) -> let (r1,r2) = split rnd
+                                                 in (r1, a ++ [rnd]))
+                                 (rnd, [])
+                                 [0..numTesters a - 1]
+      numTestsPerTester = maxSuccess a `div` numTesters a
+
+  testbudgets    <- sequence $ replicate (numTesters a) (newIORef 0)
+  discardbudgets <- sequence $ replicate (numTesters a) (newIORef 0)
+  states         <- sequence $ replicate (numTesters a) newEmptyMVar
+
+  let testerinfo = zip5 states initialSeeds [0..numTesters a - 1] testbudgets discardbudgets
+
+      tryStealBudget [] = return Nothing
+      tryStealBudget (b:bs) = do
+        v <- claimMoreBudget b
+        case v of
+          Nothing -> tryStealBudget bs
+          Just n -> return $ Just n
+
+  signal <- newEmptyMVar
+  numrunning <- newIORef (numTesters a)
+
+  flip mapM_ testerinfo $ \(st, seed, testID, testbudget, discardbudget) -> do
+    writeIORef testbudget $ if testID == 0
+                              then numTestsPerTester
+                              else numTestsPerTester + maxSuccess a `rem` numTesters a
+    writeIORef discardbudget $ if testID == 0
+                                 then numTestsPerTester * maxDiscardRatio a
+                                 else (numTestsPerTester + maxSuccess a `rem` numTesters a) * maxDiscardRatio a
+    putMVar st $ State { maxTest              = maxSuccess a
+                       , maxFail              = maxSuccess a * maxDiscardRatio a
+                       , numSuccess           = 0
+                       , numDiscarded         = 0
+                       , numRecentlyDiscarded = 0
+                       , seed                 = seed
+                       , labels               = []
+                       , size                 = computeSize a
+                       , every                = \n args -> let s = show n in s ++ [ '\b' | _ <- s]
+                       , terminal             = if chatty a then putStr else noOp
+                       , numConcurrent        = numTesters a
+                       , myId                 = testID
+                       , signalGaveUp         = do tryPutMVar signal NoMoreDiscardBudget
+                                                   return ()
+                       , signalTerminating = do b <- atomicModifyIORef' numrunning $ \i -> (i-1, i-1 == 0)
+                                                when b $ tryPutMVar signal FinishedTesting
+                       , signalFailureFound = \res  -> do tryPutMVar signal (FailureFound res)
+                                                          return ()
+                       , testBudget    = testbudget
+                       , stealTests    = tryStealBudget $ filter ((/=) testbudget) testbudgets
+                       , discardBudget = discardbudget
+                       , stealDiscards = tryStealBudget $ filter ((/=) discardbudget) discardbudgets
+                       }
+  
+  let testers = map (\vst -> testLoop vst True (property p)) states
+  tids <- mapM forkIO testers
+
+  s <- readMVar signal
+  mapM_ killThread tids
+
+  sts <- mapM readMVar states
+  let (numTests, numDiscards, theLabels) = ( sum    (map numSuccess sts)
+                                           , sum    (map numDiscarded sts)
+                                           , concat (map labels sts)
+                                           )
+  case s of
+    FailureFound res    -> putStr $ concat ["Falsifiable, after ", show numTests, " tests:\n", unlines (arguments res)]
+    FinishedTesting     -> putStr $ formatOutput "OK, passed" numTests theLabels
+    NoMoreDiscardBudget -> putStr $ formatOutput "Arguments exhausted after" numTests theLabels
+  mapM_ (putStrLn . show . numSuccess) sts
+
+  where
+    noOp _ = return ()
+
+    when :: Monad m => Bool -> m a -> m ()
+    when True ma = ma >> return ()
+    when False _ = return ()
+
+data ExitSignal
+  = FailureFound Result
+  | FinishedTesting
+  | NoMoreDiscardBudget
+
+claimMoreBudget :: IORef Int -> IO (Maybe Int)
+claimMoreBudget b =
+  atomicModifyIORef' b $ \budget -> if budget <= 0 then (0, Nothing) else (budget - 1, Just 1)
+
+tryClaimOrSteal :: IORef Int -> IO (Maybe Int) -> IO Bool
+tryClaimOrSteal r steal = do
+  b <- claimMoreBudget r
+  case b of
+    Just _  -> return True
+    Nothing -> do n <- steal
+                  case n of
+                    Nothing -> return False
+                    Just _  -> return True
+
+runOneMore :: State -> IO Bool
+runOneMore st = tryClaimOrSteal (testBudget st) (stealTests st)
+
+continueAfterDiscard :: State -> IO Bool
+continueAfterDiscard st = tryClaimOrSteal (discardBudget st) (stealDiscards st)
+
+testLoop :: MVar State -> Bool -> Property -> IO ()
+testLoop vst False f = do
+  st <- readMVar vst
+  b <- runOneMore st
+  if b then testLoop vst True f else signalTerminating st
+testLoop vst True f = do
+  st <- readMVar vst
+  let (_,s2) = split (seed st)
+      (s1,_) = split s2
+      res    = generate (size st (numSuccess st) (numRecentlyDiscarded st)) s1 (unGen f)
+  st' <- updateStateAfterResult vst st s2 res
+  case ok res of
+    Nothing    -> do
+      b <- continueAfterDiscard st'
+      if b
+        then testLoop vst True f
+        else signalGaveUp st'
+    Just True  -> testLoop vst False f
+    Just False -> signalFailureFound st' res
+
+updateStateAfterResult :: MVar State -> State -> StdGen -> Result -> IO State
+updateStateAfterResult vst st newseed res =
+  let st' = case ok res of
+             Nothing    -> st { numDiscarded         = numDiscarded st + 1
+                              , numRecentlyDiscarded = numRecentlyDiscarded st + 1
+                              , seed                 = newseed
+                              }
+             Just True  -> st { numSuccess           = numSuccess st + 1
+                              , numRecentlyDiscarded = numRecentlyDiscarded st + 1
+                              , seed                 = newseed
+                              }
+             Just False -> st
+  in do modifyMVar_ vst $ \_ -> return st'
+        return st'
 
 quick :: Args -> IO State
 quick a = do
@@ -347,40 +514,39 @@ check :: Testable a => State -> a -> IO ()
 check st a = tests st (property a)
 
 tests :: State -> Property -> IO () 
-tests st f
-  | numSuccess st   == maxTest st =
-      done "OK, passed" (numSuccess st) (labels st)
-  | numDiscarded st == maxFail st =
-      done "Arguments exhausted after" (numSuccess st) (labels st)
-  | otherwise               =
-      do terminal st (every st (numSuccess st) (arguments result))
-         case ok result of
-           Nothing    -> tests (updateAfterFail st)    f
-           Just True  -> tests (updateAfterSuccess st result) f
-           Just False ->
-             putStr ( "Falsifiable, after "
-                   ++ show (numSuccess st)
-                   ++ " tests:\n"
-                   ++ unlines (arguments result)
-                    )
-     where
-      result      = generate (size st (numSuccess st) (numRecentlyDiscarded st)) rnd2 (unGen f)
-      (rnd1,rnd2) = split (seed st)
-      updateAfterFail :: State -> State
-      updateAfterFail st = st { numDiscarded         = numDiscarded st + 1
-                              , numRecentlyDiscarded = numRecentlyDiscarded st + 1
-                              , seed                 = rnd1
-                              }
-      updateAfterSuccess :: State -> Result -> State
-      updateAfterSuccess st res = st { numSuccess           = numSuccess st + 1
-                                     , numRecentlyDiscarded = 0
-                                     , seed                 = rnd1
-                                     , labels               = stamp res : labels st
-                                     }
+tests st f = undefined
+  -- | numSuccess st   == maxTest st =
+  --     done "OK, passed" (numSuccess st) (labels st)
+  -- | numDiscarded st == maxFail st =
+  --     done "Arguments exhausted after" (numSuccess st) (labels st)
+  -- | otherwise               =
+  --     do terminal st (every st (numSuccess st) (arguments result))
+  --        case ok result of
+  --          Nothing    -> tests (updateAfterFail st)    f
+  --          Just True  -> tests (updateAfterSuccess st result) f
+  --          Just False ->
+  --            putStr ( "Falsifiable, after "
+  --                  ++ show (numSuccess st)
+  --                  ++ " tests:\n"
+  --                  ++ unlines (arguments result)
+  --                   )
+  --    where
+  --     result      = generate (size st (numSuccess st) (numRecentlyDiscarded st)) rnd2 (unGen f)
+  --     (rnd1,rnd2) = split (seed st)
+  --     updateAfterFail :: State -> State
+  --     updateAfterFail st = st { numDiscarded         = numDiscarded st + 1
+  --                             , numRecentlyDiscarded = numRecentlyDiscarded st + 1
+  --                             , seed                 = rnd1
+  --                             }
+  --     updateAfterSuccess :: State -> Result -> State
+  --     updateAfterSuccess st res = st { numSuccess           = numSuccess st + 1
+  --                                    , numRecentlyDiscarded = 0
+  --                                    , seed                 = rnd1
+  --                                    , labels               = stamp res : labels st
+  --                                    }
 
-done :: String -> Int -> [[String]] -> IO ()
-done mesg ntest stamps =
-  do putStr ( mesg ++ " " ++ show ntest ++ " tests" ++ table )
+formatOutput :: String -> Int -> [[String]] -> String
+formatOutput mesg ntest stamps = concat [mesg, " ", show ntest, " tests", table]
  where
   table = display
         . map entry
